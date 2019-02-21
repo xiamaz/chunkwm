@@ -1743,6 +1743,7 @@ bool SendWindowToMonitor(macos_window *Window, char *Op)
     macos_space *Space, *DestinationSpace;
     unsigned SourceMonitor, DestinationMonitor;
     CFStringRef SourceMonitorRef, DestinationMonitorRef;
+    int Operation;
 
     __AppleGetDisplayIdentifierFromMacOSWindowO(Window, SourceMonitorRef);
     ASSERT(SourceMonitorRef);
@@ -1760,11 +1761,14 @@ bool SendWindowToMonitor(macos_window *Window, char *Op)
 
     if (StringEquals(Op, "prev")) {
         DestinationMonitor = SourceMonitor - 1;
+        Operation = -1;
     } else if (StringEquals(Op, "next")) {
         DestinationMonitor = SourceMonitor + 1;
+        Operation = 1;
     } else if (sscanf(Op, "%d", &DestinationMonitor) == 1) {
         // NOTE(koekeishiya): Convert 1-indexed back to 0-index expected by the system.
         --DestinationMonitor;
+        Operation = 0;
     } else {
         c_log(C_LOG_LEVEL_WARN, "invalid destination monitor specified '%s'!\n", Op);
         Success = false;
@@ -1781,6 +1785,16 @@ bool SendWindowToMonitor(macos_window *Window, char *Op)
     }
 
     DestinationMonitorRef = AXLibGetDisplayIdentifierFromArrangement(DestinationMonitor);
+    if (Operation && !DestinationMonitorRef) {
+        char *FocusCycleMode = CVarStringValue(CVAR_WINDOW_FOCUS_CYCLE);
+        ASSERT(FocusCycleMode);
+        if ((StringEquals(FocusCycleMode, Window_Focus_Cycle_All)) ||
+            (CVarIntegerValue(CVAR_MONITOR_FOCUS_CYCLE))) {
+            DestinationMonitor = Operation == -1 ? AXLibDisplayCount() - 1 : 0;
+            DestinationMonitorRef = AXLibGetDisplayIdentifierFromArrangement(DestinationMonitor);
+        }
+    }
+
     if (!DestinationMonitorRef) {
         // NOTE(koekeishiya): Convert 0-indexed back to 1-index when printng error to user.
         c_log(C_LOG_LEVEL_WARN,
