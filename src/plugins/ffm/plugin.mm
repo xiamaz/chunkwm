@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "../../api/plugin_api.h"
+#include "../../common/accessibility/display.h"
 #include "../../common/accessibility/element.h"
 #include "../../common/accessibility/window.h"
 #include "../../common/accessibility/application.h"
@@ -11,6 +12,7 @@
 #include "../../common/dispatch/cgeventtap.h"
 
 #include "../../common/accessibility/element.cpp"
+#include "../../common/accessibility/display.mm"
 #include "../../common/config/cvar.cpp"
 #include "../../common/config/tokenize.cpp"
 #include "../../common/dispatch/cgeventtap.cpp"
@@ -20,7 +22,7 @@
 #define local_persist static
 
 extern "C" int CGSMainConnectionID(void);
-extern "C" CGError CGSGetWindowLevel(const int cid, int wid, int *wlvl);
+extern "C" CGError CGSGetWindowLevel(const int cid, uint32_t wid, uint32_t *wlvl);
 extern "C" OSStatus CGSFindWindowByGeometry(int cid, int zero, int one, int zero_again, CGPoint *screen_point, CGPoint *window_coords_out, int *wid_out, int *cid_out);
 extern "C" CGError CGSConnectionGetPID(const int cid, pid_t *pid);
 
@@ -33,9 +35,13 @@ internal AXUIElementRef SystemWideElement;
 internal float MouseMotionInterval;
 internal float LastEventTime;
 internal bool StandbyOnFloat;
+internal bool AlwaysSwitchDisplay;
+
+internal bool volatile FloatDesktop;
+internal CFStringRef LastDisplay;
 
 internal bool
-IsWindowLevelAllowed(int WindowLevel)
+FfmIsWindowLevelAllowed(int WindowLevel)
 {
     local_persist int ValidWindowLevels[] = {
         CGWindowLevelForKey(kCGNormalWindowLevelKey),
@@ -51,6 +57,23 @@ IsWindowLevelAllowed(int WindowLevel)
     }
 
     return false;
+}
+
+internal bool
+HasDisplayChanged(CGEventRef Event)
+{
+    CGPoint CursorPosition = CGEventGetLocation(Event);
+    CFStringRef DisplayRef = AXLibGetDisplayIdentifierFromWindowRect(CursorPosition, (CGSize) {1.0, 1.0});
+    bool changed = false;
+
+    if (!LastDisplay) {
+        LastDisplay = DisplayRef;
+    } else if (CFStringCompare(LastDisplay, DisplayRef, 0) != 0) {
+        CFRelease(LastDisplay);
+        LastDisplay = DisplayRef;
+        changed = true;
+    }
+    return changed;
 }
 
 internal inline void
@@ -73,8 +96,8 @@ FocusFollowsMouse(CGEventRef Event)
     if (Connection == WindowConnection) return;
     if (WindowId == FocusedWindowId)    return;
 
-    CGSGetWindowLevel(Connection, WindowId, &WindowLevel);
-    if (!IsWindowLevelAllowed(WindowLevel)) return;
+    CGSGetWindowLevel(Connection, (uint32_t) WindowId, (uint32_t *) &WindowLevel);
+    if (!FfmIsWindowLevelAllowed(WindowLevel)) return;
     CGSConnectionGetPID(WindowConnection, &WindowPid);
 
     AXUIElementCopyElementAtPosition(SystemWideElement, CursorPosition.x, CursorPosition.y, &Element);
@@ -109,6 +132,7 @@ ShouldProcessEvent(CGEventRef Event)
 EVENTTAP_CALLBACK(EventTapCallback)
 {
     event_tap *EventTap = (event_tap *) Reference;
+
     switch (Type) {
     case kCGEventTapDisabledByTimeout:
     case kCGEventTapDisabledByUserInput: {
@@ -116,7 +140,8 @@ EVENTTAP_CALLBACK(EventTapCallback)
     } break;
     case kCGEventMouseMoved: {
         if (!ShouldProcessEvent(Event)) break;
-        if (StandbyOnFloat && !IsActive) break;
+
+        if (!(AlwaysSwitchDisplay && HasDisplayChanged(Event)) && (StandbyOnFloat && (!IsActive || FloatDesktop))) break;
 
         CGEventFlags Flags = CGEventGetFlags(Event);
         if ((Flags & MouseModifier) == MouseModifier) break;
@@ -157,6 +182,13 @@ TilingWindowFloatHandler(void *Data)
 }
 
 internal inline void
+TilingDesktopModeHandler(void *Data)
+{
+    char *modeString = (char *)Data;
+    FloatDesktop = strcmp(modeString, "float") == 0;
+}
+
+internal inline void
 SetMouseModifier(const char *Mod)
 {
     while (Mod && *Mod) {
@@ -189,6 +221,9 @@ PLUGIN_MAIN_FUNC(PluginMain)
     } else if (strcmp(Node, "Tiling_focused_window_float") == 0) {
         TilingWindowFloatHandler(Data);
         return true;
+    } else if (strcmp(Node, "Tiling_focused_desktop_mode") == 0) {
+        TilingDesktopModeHandler(Data);
+        return true;
     }
     return false;
 }
@@ -200,15 +235,18 @@ PLUGIN_BOOL_FUNC(PluginInit)
     if (!SystemWideElement) return false;
 
     IsActive = true;
+    FloatDesktop = false;
     EventTap.Mask = (1 << kCGEventMouseMoved);
     bool Result = BeginEventTap(&EventTap, &EventTapCallback);
     if (Result) {
         BeginCVars(&API);
         CreateCVar("ffm_bypass_modifier", "fn");
         CreateCVar("ffm_standby_on_float", 1);
+        CreateCVar("ffm_always_switch_display", 1);
         CreateCVar("mouse_motion_interval", 35.0f);
         SetMouseModifier(CVarStringValue("ffm_bypass_modifier"));
         StandbyOnFloat = CVarIntegerValue("ffm_standby_on_float");
+        AlwaysSwitchDisplay = CVarIntegerValue("ffm_always_switch_display");
         MouseMotionInterval = CVarFloatingPointValue("mouse_motion_interval");
     }
     return Result;

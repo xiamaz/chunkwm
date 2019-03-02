@@ -1,8 +1,8 @@
 BUILD_FLAGS		= -O0 -g -DCHUNKWM_DEBUG -std=c++11 -Wall
 BUILD_PATH		= ./../../../plugins
-SRC				= ./plugin.cpp
+SRC				= ./plugin.mm
 BINS			= $(BUILD_PATH)/ffm.so
-LINK			= -shared -fPIC -framework Carbon -framework ApplicationServices
+LINK			= -shared -fPIC -framework Carbon -framework Cocoa -framework ApplicationServices
 
 all: $(BINS)
 
