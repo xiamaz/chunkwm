@@ -18,29 +18,79 @@ internal const char *PluginName = "subscribe";
 internal const char *PluginVersion = "0.1.0";
 internal chunkwm_api API;
 
-internal const char *SockPath = "socket";
+internal const char *SockPath = "/tmp/chunkwm-subscribe";
 int sockfd;
 pthread_t accept_thread_id;
 
-int msgfds[2];
+typedef struct _fdsnode {
+    int id;
+    int fds[2];
+    struct _fdsnode *next;
+} fdsnode;
+
+fdsnode *fdlist = NULL;
 
 chunkwm_log *c_log;
+
+fdsnode*
+AppendNode(int id)
+{
+    fdsnode *curfd;
+    fdsnode *newnode = (fdsnode*) malloc(sizeof(fdsnode));
+    newnode->id = id;
+    if (pipe(newnode->fds) == -1) {
+        c_log(C_LOG_LEVEL_ERROR, "Failed to create message pipes\n");
+        return NULL;
+    }
+    newnode->next = NULL;
+    if (fdlist) {
+        curfd = fdlist;
+        while (curfd->next) curfd = curfd->next;
+        curfd->next = newnode;
+    } else {
+        fdlist = newnode;
+    }
+    return newnode;
+}
+
+
+int
+DeleteNode(int id)
+{
+    fdsnode *prevfd = NULL;
+    fdsnode *curfd = fdlist;
+    while (curfd) {
+        if (curfd->id == id) {
+            if (prevfd) prevfd->next = curfd->next;
+            else fdlist = curfd->next;
+            close(curfd->fds[0]);
+            close(curfd->fds[1]);
+            free(curfd);
+            return 0;
+        }
+        prevfd = curfd;
+        curfd = curfd->next;
+    }
+    return -1;
+}
+
 
 void*
 HandleConnection(void* arg)
 {
-    int socket = *(int*)arg;
+    fdsnode *cur = (fdsnode*)arg;
 
     struct pollfd fds[2];
 
     char buffer[1024];
     ssize_t received;
 
-    fds[0] = {msgfds[0], POLLIN | POLLPRI, 0};
-    fds[1] = {socket, POLLIN | POLLPRI, 0};
+    fds[0] = {cur->fds[0], POLLIN | POLLPRI, 0};
+    fds[1] = {cur->id, POLLIN | POLLPRI, 0};
 
     int rbytes;
     int offset = 0;
+    printf("Handling pipes %d %d\n", cur->id, cur->fds[0]);
     while (true) {
         if (poll(fds, 2, -1) < 1) {
             c_log(C_LOG_LEVEL_ERROR, "Poll failed\n");
@@ -63,10 +113,13 @@ HandleConnection(void* arg)
                 break;
             }
         }
+        offset = 0;
+        memset(buffer, 0, 1024);
     }
-    if (close(socket) == -1) {
+    if (close(cur->id) == -1) {
         c_log(C_LOG_LEVEL_ERROR, "Failed to handle client\n");
     }
+    DeleteNode(cur->id);
     return NULL;
 }
 
@@ -74,15 +127,16 @@ void*
 AcceptConnections(void* arg)
 {
     int sockfd = *(int*)arg;
-    int client_sockfd;
+    int client_sock;
+    fdsnode *args;
     while (true) {
         pthread_t pthread_id;
-        if ((client_sockfd = accept(sockfd, NULL, NULL)) == -1) {
+        if ((client_sock = accept(sockfd, NULL, NULL)) == -1) {
             c_log(C_LOG_LEVEL_ERROR, "Failed to accept client\n");
             continue;
         }
-        pthread_create(&pthread_id, NULL, HandleConnection, (void*) &client_sockfd);
-        // close(client_sockfd);
+        args = AppendNode(client_sock);
+        pthread_create(&pthread_id, NULL, HandleConnection, (void*) args);
     }
     return NULL;
 }
@@ -103,8 +157,12 @@ StringsAreEqual(const char *A, const char *B)
 PLUGIN_MAIN_FUNC(PluginMain)
 {
     char log_message[256];
-    snprintf(log_message, 255, "%s\n", Node);
-    write(msgfds[1], log_message, strlen(log_message));
+    snprintf(log_message, 254, "%s\n", Node);
+    fdsnode *curnode = fdlist;
+    while (curnode != NULL) {
+        write(curnode->fds[1], log_message, strlen(log_message));
+        curnode = curnode->next;
+    }
     return false;
 }
 
@@ -117,11 +175,6 @@ PLUGIN_BOOL_FUNC(PluginInit)
 {
     API = ChunkwmAPI;
     c_log = API.Log;
-
-    if (pipe(msgfds) == -1) {
-        c_log(C_LOG_LEVEL_ERROR, "Failed to create message pipes\n");
-        return false;
-    }
 
     if ((sockfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
         c_log(C_LOG_LEVEL_ERROR, "Failed to create socket\n");
@@ -152,6 +205,15 @@ PLUGIN_VOID_FUNC(PluginDeInit)
 {
     close(sockfd);
     unlink(SockPath);
+
+    fdsnode *prevnode = NULL;
+    fdsnode *curnode = fdlist;
+    while (curnode) {
+        prevnode = curnode;
+        curnode = curnode->next;
+        free(prevnode);
+    }
+    free(curnode);
 }
 
 // NOTE(koekeishiya): Enable to manually trigger ABI mismatch
