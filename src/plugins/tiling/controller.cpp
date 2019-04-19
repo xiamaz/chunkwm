@@ -61,6 +61,58 @@ GetActiveSpace()
     return GetActiveSpace(Window);
 }
 
+CFStringRef
+GetMonitorRef(char *Op)
+{
+    bool Success, Cycle;
+    macos_space *Space;
+    CFStringRef MonitorRef = NULL;
+    int Operation;
+    unsigned SourceMonitor, DestinationMonitor, MonitorCount;
+
+    char *WindowCycleMode = CVarStringValue(CVAR_WINDOW_FOCUS_CYCLE);
+    ASSERT(WindowCycleMode);
+    Cycle = ((StringEquals(WindowCycleMode, Window_Focus_Cycle_All)) || CVarIntegerValue(CVAR_MONITOR_FOCUS_CYCLE));
+
+    Space = GetActiveSpace();
+    ASSERT(Space);
+
+    MonitorCount = AXLibDisplayCount();
+    if (!MonitorCount) {
+        c_log(C_LOG_LEVEL_ERROR, "Cannot get monitor count\n");
+        goto space_free;
+    }
+
+    Success = AXLibCGSSpaceIDToDesktopID(Space->Id, &SourceMonitor, NULL);
+    ASSERT(Success);
+
+    if (StringEquals(Op, "prev")) {
+        DestinationMonitor = SourceMonitor - 1;
+        if (Cycle && DestinationMonitor < 0) DestinationMonitor = MonitorCount - 1;
+        Operation = -1;
+    } else if (StringEquals(Op, "next")) {
+        DestinationMonitor = SourceMonitor + 1;
+        if (Cycle && DestinationMonitor >= MonitorCount) DestinationMonitor = 0;
+        Operation = 1;
+    } else if (sscanf(Op, "%d", &DestinationMonitor) == 1) {
+        --DestinationMonitor;
+        Operation = 0;
+    } else {
+        c_log(C_LOG_LEVEL_WARN, "invalid destination monitor specified '%s'!\n", Op);
+        goto space_free;
+    }
+
+    MonitorRef = AXLibGetDisplayIdentifierFromArrangement(DestinationMonitor);
+    if (!MonitorRef) {
+        c_log(C_LOG_LEVEL_WARN,
+              "invalid destination monitor specified, monitor '%d' does not exist!\n",
+              DestinationMonitor + 1);
+    }
+space_free:
+    AXLibDestroySpace(Space);
+    return MonitorRef;
+}
+
 internal bool
 IsCursorInRegion(region *Region)
 {
@@ -1738,12 +1790,10 @@ void SendWindowToDesktop(char *Op)
 bool SendWindowToMonitor(macos_window *Window, char *Op)
 {
     CGRect NormalizedWindow;
-    bool Success, ValidWindow;
+    bool Success = false, ValidWindow;
     std::vector<uint32_t> WindowIds;
     macos_space *Space, *DestinationSpace;
-    unsigned SourceMonitor, DestinationMonitor;
     CFStringRef SourceMonitorRef, DestinationMonitorRef;
-    int Operation;
 
     __AppleGetDisplayIdentifierFromMacOSWindowO(Window, SourceMonitorRef);
     ASSERT(SourceMonitorRef);
@@ -1751,56 +1801,15 @@ bool SendWindowToMonitor(macos_window *Window, char *Op)
     Space = AXLibActiveSpace(SourceMonitorRef);
     ASSERT(Space);
 
-    if (Space->Type != kCGSSpaceUser) {
-        Success = false;
-        goto space_free;
-    }
-
-    Success = AXLibCGSSpaceIDToDesktopID(Space->Id, &SourceMonitor, NULL);
-    ASSERT(Success);
-
-    if (StringEquals(Op, "prev")) {
-        DestinationMonitor = SourceMonitor - 1;
-        Operation = -1;
-    } else if (StringEquals(Op, "next")) {
-        DestinationMonitor = SourceMonitor + 1;
-        Operation = 1;
-    } else if (sscanf(Op, "%d", &DestinationMonitor) == 1) {
-        // NOTE(koekeishiya): Convert 1-indexed back to 0-index expected by the system.
-        --DestinationMonitor;
-        Operation = 0;
-    } else {
-        c_log(C_LOG_LEVEL_WARN, "invalid destination monitor specified '%s'!\n", Op);
-        Success = false;
-        goto space_free;
-    }
-
-    if (DestinationMonitor == SourceMonitor) {
-        // NOTE(koekeishiya): Convert 0-indexed back to 1-index when printng error to user.
-        c_log(C_LOG_LEVEL_WARN,
-              "invalid destination monitor specified, source monitor and destination '%d' are the same!\n",
-              DestinationMonitor + 1);
-        Success = false;
-        goto space_free;
-    }
-
-    DestinationMonitorRef = AXLibGetDisplayIdentifierFromArrangement(DestinationMonitor);
-    if (Operation && !DestinationMonitorRef) {
-        char *FocusCycleMode = CVarStringValue(CVAR_WINDOW_FOCUS_CYCLE);
-        ASSERT(FocusCycleMode);
-        if ((StringEquals(FocusCycleMode, Window_Focus_Cycle_All)) ||
-            (CVarIntegerValue(CVAR_MONITOR_FOCUS_CYCLE))) {
-            DestinationMonitor = Operation == -1 ? AXLibDisplayCount() - 1 : 0;
-            DestinationMonitorRef = AXLibGetDisplayIdentifierFromArrangement(DestinationMonitor);
-        }
-    }
-
+    DestinationMonitorRef = GetMonitorRef(Op);
     if (!DestinationMonitorRef) {
         // NOTE(koekeishiya): Convert 0-indexed back to 1-index when printng error to user.
+        goto space_free;
+    }
+    if (CFStringCompare(SourceMonitorRef, DestinationMonitorRef, 0) == kCFCompareEqualTo) {
+        // NOTE(koekeishiya): Convert 0-indexed back to 1-index when printng error to user.
         c_log(C_LOG_LEVEL_WARN,
-              "invalid destination monitor specified, monitor '%d' does not exist!\n",
-              DestinationMonitor + 1);
-        Success = false;
+              "invalid destination monitor specified, source monitor and destination are the same!\n");
         goto space_free;
     }
 
@@ -1854,6 +1863,7 @@ bool SendWindowToMonitor(macos_window *Window, char *Op)
         ReleaseVirtualSpace(DestinationVirtualSpace);
     }
 
+    Success = true;
     __AppleFreeDisplayIdentifierFromWindowO(SourceMonitorRef);
 
 dest_space_free:
@@ -1861,8 +1871,6 @@ dest_space_free:
     CFRelease(DestinationMonitorRef);
 
 space_free:
-    AXLibDestroySpace(Space);
-
     return Success;
 }
 
@@ -1874,24 +1882,15 @@ void SendWindowToMonitor(char *Op)
     }
 }
 
+
 internal bool
-FocusMonitor(unsigned MonitorId)
+FocusMonitor(CFStringRef MonitorRef)
 {
     bool Result = false;
     std::vector<uint32_t> WindowIds;
     bool IncludeInvalidWindows;
-    CFStringRef MonitorRef;
     macos_window *Window;
     macos_space *Space;
-
-    MonitorRef = AXLibGetDisplayIdentifierFromArrangement(MonitorId);
-    if (!MonitorRef) {
-        // NOTE(koekeishiya): Convert 0-indexed back to 1-index when printng error to user.
-        c_log(C_LOG_LEVEL_WARN,
-              "invalid destination monitor specified, monitor '%d' does not exist!\n",
-              MonitorId + 1);
-        goto out;
-    }
 
     Space = AXLibActiveSpace(MonitorRef);
     ASSERT(Space);
@@ -1912,77 +1911,39 @@ FocusMonitor(unsigned MonitorId)
 
 space_free:
     AXLibDestroySpace(Space);
-    CFRelease(MonitorRef);
+    return Result;
+}
 
-out:
+internal bool
+FocusMonitor(unsigned MonitorId)
+{
+    bool Result = false;
+    CFStringRef MonitorRef = AXLibGetDisplayIdentifierFromArrangement(MonitorId);
+    if (!MonitorRef) {
+        c_log(C_LOG_LEVEL_WARN,
+              "invalid destination monitor specified, monitor '%d' does not exist!\n",
+              MonitorId + 1);
+        goto space_free;
+    }
+    Result = FocusMonitor(MonitorRef);
+space_free:
+    CFRelease(MonitorRef);
     return Result;
 }
 
 void FocusMonitor(char *Op)
 {
-    bool Success;
-    int Operation;
-    macos_space *Space;
-    unsigned SourceMonitor, DestinationMonitor;
+    CFStringRef MonitorRef;
 
-    Space = GetActiveSpace();
-    ASSERT(Space);
-
-    Success = AXLibCGSSpaceIDToDesktopID(Space->Id, &SourceMonitor, NULL);
-    ASSERT(Success);
-
-    if (StringEquals(Op, "prev")) {
-        DestinationMonitor = SourceMonitor - 1;
-        Operation = -1;
-    } else if (StringEquals(Op, "next")) {
-        DestinationMonitor = SourceMonitor + 1;
-        Operation = 1;
-    } else if (sscanf(Op, "%d", &DestinationMonitor) == 1) {
-        // NOTE(koekeishiya): Convert 1-indexed back to 0-index expected by the system.
-        --DestinationMonitor;
-        Operation = 0;
-    } else {
-        c_log(C_LOG_LEVEL_WARN, "invalid destination monitor specified '%s'!\n", Op);
-        goto space_free;
+    MonitorRef = GetMonitorRef(Op);
+    if (!MonitorRef) {
+      goto space_free;
     }
 
-    if (DestinationMonitor == SourceMonitor) {
-        c_log(C_LOG_LEVEL_WARN,
-              "invalid destination monitor specified, source monitor and destination '%d' are the same!\n",
-              DestinationMonitor + 1);
-        goto space_free;
-    }
-
-    switch (Operation) {
-    case -1: {
-        if (!FocusMonitor(DestinationMonitor)) {
-            char *FocusCycleMode = CVarStringValue(CVAR_WINDOW_FOCUS_CYCLE);
-            ASSERT(FocusCycleMode);
-            if ((StringEquals(FocusCycleMode, Window_Focus_Cycle_All)) ||
-                (CVarIntegerValue(CVAR_MONITOR_FOCUS_CYCLE))) {
-                DestinationMonitor = AXLibDisplayCount() - 1;
-                FocusMonitor(DestinationMonitor);
-            }
-        }
-    } break;
-    case 0: {
-        FocusMonitor(DestinationMonitor);
-    } break;
-    case 1: {
-        if (!FocusMonitor(DestinationMonitor)) {
-            char *FocusCycleMode = CVarStringValue(CVAR_WINDOW_FOCUS_CYCLE);
-            ASSERT(FocusCycleMode);
-            if ((StringEquals(FocusCycleMode, Window_Focus_Cycle_All)) ||
-                (CVarIntegerValue(CVAR_MONITOR_FOCUS_CYCLE))) {
-                DestinationMonitor = 0;
-                FocusMonitor(DestinationMonitor);
-            }
-        }
-    } break;
-    }
+    FocusMonitor(MonitorRef);
 
 space_free:
-    AXLibDestroySpace(Space);
+    CFRelease(MonitorRef);
 }
 
 void GridLayout(macos_window *Window, char *Op)
@@ -2258,28 +2219,8 @@ void MoveDesktop(char *Op)
     unsigned CurrentArrangement = 0;
     unsigned Arrangement = 0;
     bool IncludeFullscreenSpaces = 0;
-    if (StringEquals(Op, "prev")) {
-        IncludeFullscreenSpaces = true;
-        CurrentSpaceId = CurrentDesktopId(&DesktopId, &CurrentArrangement, IncludeFullscreenSpaces);
-        Arrangement = CurrentArrangement - 1;
-    } else if (StringEquals(Op, "next")) {
-        IncludeFullscreenSpaces = true;
-        CurrentSpaceId = CurrentDesktopId(&DesktopId, &CurrentArrangement, IncludeFullscreenSpaces);
-        Arrangement = CurrentArrangement + 1;
-    } else if (sscanf(Op, "%d", &Arrangement) == 1) {
-        CurrentSpaceId = CurrentDesktopId(&DesktopId, &CurrentArrangement, IncludeFullscreenSpaces);
-        --Arrangement;
-    } else {
-        return;
-    }
 
-    // TODO(koekeishiya): Do we want to allow monitor wrapping ??
-    if (Arrangement == CurrentArrangement) return;
-    if (Arrangement < 0) return;
-    unsigned DisplayCount = AXLibDisplayCount();
-    if (Arrangement > DisplayCount) return;
-
-    CFStringRef DisplayRef = AXLibGetDisplayIdentifierFromArrangement(Arrangement);
+    CFStringRef DisplayRef = GetMonitorRef(Op);
     if (!DisplayRef) return;
 
     macos_space *Space = AXLibActiveSpace(DisplayRef);
