@@ -25,6 +25,12 @@ chunkwm_log *c_log;
 std::vector<unsigned> DesktopCounts;
 
 void
+BroadcastDesktopRefresh()
+{
+    API.Broadcast(PluginName, "spaces_set", 0, 0);
+}
+
+void
 SetDesktopCounts(const char *definition)
 {
     std::string input(definition);
@@ -56,13 +62,14 @@ CreateDesktop(macos_display *Display)
 
     int SockFD;
 
-    c_log(C_LOG_LEVEL_WARN, "Create space for display %d\n", Display->Arrangement);
+    c_log(C_LOG_LEVEL_DEBUG, "Create space for display %d\n", Display->Arrangement);
     if (ConnectToDaemon(&SockFD, 5050)) {
         char Message[64];
         sprintf(Message, "space_create %d", Space->Id);
         WriteToSocket(Message, SockFD);
     }
     CloseSocket(SockFD);
+    usleep(100 * 1000);
 
     AXLibDestroySpace(Space);
 }
@@ -75,7 +82,7 @@ DeleteDesktop(macos_display *Display)
     if (Space->Type != kCGSSpaceUser) goto free_spaces;
 
     int SockFD;
-    c_log(C_LOG_LEVEL_WARN, "Delete space for display %d\n", Display->Arrangement);
+    c_log(C_LOG_LEVEL_DEBUG, "Delete space for display %d\n", Display->Arrangement);
     if (ConnectToDaemon(&SockFD, 5050)) {
         char Message[64];
         sprintf(Message, "space_destroy %d", Space->Id);
@@ -131,16 +138,25 @@ SetMonitors()
         AXLibDestroyDisplay(Display);
     }
     free(Displays);
+    if (Success) {
+        BroadcastDesktopRefresh();
+    }
     return Success;
 }
 
 inline bool
-MonitorChanged(uint32_t MonitorId)
+DaemonCommandHandler(void *Data)
 {
-    CFStringRef MonitorRef = AXLibGetDisplayIdentifier(MonitorId);
-    c_log(C_LOG_LEVEL_WARN,
-          "Monitor changed %s\n",
-          CFStringGetCStringPtr(MonitorRef, kCFStringEncodingUTF8));
+    chunkwm_payload *Payload = (chunkwm_payload *) Data;
+    if (strcmp(Payload->Command, "refresh") == 0) {
+        if (SetMonitors()) {
+            WriteToSocket("Monitor spaces set successful.", Payload->SockFD);
+        } else {
+            WriteToSocket("Monitor spaces set failed.", Payload->SockFD);
+        }
+    } else {
+        WriteToSocket("Unknown command to monitors", Payload->SockFD);
+    };
     return false;
 }
 
@@ -158,6 +174,8 @@ PLUGIN_MAIN_FUNC(PluginMain)
         return SetMonitors();
     } else if (strcmp(Node, "chunkwm_export_space_changed") == 0) {
         // return SpaceChanged();
+    } else if (strcmp(Node, "chunkwm_daemon_command") == 0) {
+        return DaemonCommandHandler(Data);
     }
 
     return false;
