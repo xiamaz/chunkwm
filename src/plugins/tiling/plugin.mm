@@ -1570,6 +1570,13 @@ DisplayRemovedHandler(void *Data)
 #endif
 
 internal void
+MonitorsSpacesHandler()
+{
+    /* Reapply window rules to all windows */
+    for (window_rule *rule : WindowRules) ApplyRuleToExistingWindows(rule);
+}
+
+internal void
 ChunkwmDaemonCommandHandler(void *Data)
 {
     chunkwm_payload *Payload = (chunkwm_payload *) Data;
@@ -1653,6 +1660,9 @@ PLUGIN_MAIN_FUNC(PluginMain)
             }
             WindowFocusedHandler(WindowId);
         }
+    } else if (StringEquals(Node, "monitors_spaces_set")) {
+        MonitorsSpacesHandler();
+        return true;
     }
 
     return false;
