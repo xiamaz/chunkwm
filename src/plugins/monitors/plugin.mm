@@ -1,12 +1,17 @@
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
+#include <string>
+#include <sstream>
 
 #include "../../api/plugin_api.h"
 #include "../../common/accessibility/display.h"
+#include "../../common/config/cvar.h"
 #include "../../common/ipc/daemon.h"
 
 #include "../../common/accessibility/display.mm"
 #include "../../common/accessibility/element.cpp"
+#include "../../common/config/cvar.cpp"
 #include "../../common/ipc/daemon.cpp"
 
 #define internal static
@@ -16,121 +21,117 @@ internal const char *PluginVersion = "0.1.0";
 internal chunkwm_api API;
 chunkwm_log *c_log;
 
+#define MAX_DESKTOP
+std::vector<unsigned> DesktopCounts;
+
 void
-CreateDesktop(macos_space *Space)
+SetDesktopCounts(const char *definition)
 {
+    std::string input(definition);
+    std::stringstream stream(input);
+    int n;
+    DesktopCounts.clear();
+    while (stream >> n) {
+        DesktopCounts.push_back(n);
+    }
+}
+
+int
+ArrangementToCount(unsigned arrangement)
+{
+    int count;
+    try {
+        count = DesktopCounts.at(arrangement);
+    } catch (const std::out_of_range &e) {
+        count = -1;
+    }
+    return count;
+}
+
+void
+CreateDesktop(macos_display *Display)
+{
+    macos_space *Space = AXLibActiveSpace(Display->Ref);
+    if (!Space) return;
+
     int SockFD;
 
+    c_log(C_LOG_LEVEL_WARN, "Create space for display %d\n", Display->Arrangement);
     if (ConnectToDaemon(&SockFD, 5050)) {
         char Message[64];
         sprintf(Message, "space_create %d", Space->Id);
         WriteToSocket(Message, SockFD);
     }
     CloseSocket(SockFD);
+
+    AXLibDestroySpace(Space);
 }
 
 void
-DeleteDesktop()
+DeleteDesktop(macos_display *Display)
 {
-    macos_space *Space;
-    if (!AXLibActiveSpace(&Space)) {
-        c_log(C_LOG_LEVEL_WARN, "Failed to get current space\n");
-    }
+    macos_space *Space = AXLibActiveSpace(Display->Ref);
+    if (!Space) return;
+    if (Space->Type != kCGSSpaceUser) goto free_spaces;
 
     int SockFD;
-
-    c_log(C_LOG_LEVEL_WARN, "Delete space\n");
+    c_log(C_LOG_LEVEL_WARN, "Delete space for display %d\n", Display->Arrangement);
     if (ConnectToDaemon(&SockFD, 5050)) {
         char Message[64];
         sprintf(Message, "space_destroy %d", Space->Id);
         WriteToSocket(Message, SockFD);
     }
     CloseSocket(SockFD);
+    /* Slow delete to make sure desktops are deleted */
+    usleep(100 * 1000);
+
+free_spaces:
+    AXLibDestroySpace(Space);
 }
 
-unsigned
-GetCurrentSpaces(CFStringRef MonitorRef, macos_space **Space)
+inline int
+MonitorSpacesCount(macos_display *Display)
 {
-    macos_space *CurSpace, **List, **Spaces;
-    List = Spaces = AXLibSpacesForDisplay(MonitorRef);
-	unsigned count = 0;
-    while ((CurSpace = *List++)) {
-        if (!count) {
-            *Space = CurSpace;
-        } else {
-            AXLibDestroySpace(CurSpace);
-        }
-        count++;
-    }
-    free(Spaces);
+    int count, *spaces;
+    spaces = AXLibSpacesForDisplay(Display->Ref, &count);
+    free(spaces);
     return count;
 }
 
-void
-CreateMonitorSpaces(CFStringRef MonitorRef, unsigned count)
+inline bool
+SetMonitorDesktops(macos_display *Display)
 {
-    macos_space *Space, *LastSpace, **List, **Spaces;
-    List = Spaces = AXLibSpacesForDisplay(MonitorRef);
-	unsigned current = 0;
-    while ((Space = *List++)) {
-        LastSpace = Space;
-        current++;
-    }
-    c_log(C_LOG_LEVEL_WARN, "M %d/%d\n", current, count);
-    if (current < count) {
-        while (current < count) {
-            CreateDesktop(LastSpace);
-            current++;
+    int count, *spaces;
+    spaces = AXLibSpacesForDisplay(Display->Ref, &count);
+    int wanted = ArrangementToCount(Display->Arrangement);
+    if (wanted > 0) {
+        while (count < wanted) {
+            CreateDesktop(Display);
+            count++;
         }
-    } else {
-        current = 0;
-        List = Spaces;
-        while ((Space = *List++)) {
-            if (current >= count) DeleteDesktop();
-            current++;
+        while (count > wanted) {
+            DeleteDesktop(Display);
+            count--;
         }
     }
-
-    List = Spaces;
-    while ((Space = *List++)) {
-        AXLibDestroySpace(Space);
-    }
-    free(Spaces);
-}
-
-void
-MonitorSpaces(CFStringRef MonitorRef)
-{
-    macos_space *Space, **List, **Spaces;
-    List = Spaces = AXLibSpacesForDisplay(MonitorRef);
-    c_log(C_LOG_LEVEL_WARN, "M %s:\n",
-          CFStringGetCStringPtr(MonitorRef, kCFStringEncodingUTF8));
-    while ((Space = *List++)) {
-        c_log(C_LOG_LEVEL_WARN, "Space\n");
-        AXLibDestroySpace(Space);
-    }
-    c_log(C_LOG_LEVEL_WARN, "END\n");
-    free(Spaces);
+    free(spaces);
+    return wanted == MonitorSpacesCount(Display);
 }
 
 inline bool
-SpaceChanged()
+SetMonitors()
 {
-    macos_space *Space;
-    if (!AXLibActiveSpace(&Space)) {
-        c_log(C_LOG_LEVEL_WARN, "Failed to get current space\n");
-        return false;
+    bool Success = true;
+    unsigned count;
+    macos_display *Display, **Displays;
+    Displays = AXLibDisplayList(&count);
+    for (int i = 0; i < count; i++) {
+        Display = Displays[i];
+        if (!SetMonitorDesktops(Display)) Success = false;
+        AXLibDestroyDisplay(Display);
     }
-    CFStringRef MonitorRef = AXLibGetDisplayIdentifierFromSpace(Space->Id);
-    if (!MonitorRef) {
-        c_log(C_LOG_LEVEL_WARN, "Failed to get current monitor\n");
-        goto free_spaces;
-    }
-    MonitorSpaces(MonitorRef);
-    CreateMonitorSpaces(MonitorRef, 3);
-free_spaces:
-    AXLibDestroySpace(Space);
-    return false;
+    free(Displays);
+    return Success;
 }
 
 inline bool
@@ -151,14 +152,12 @@ MonitorChanged(uint32_t MonitorId)
  */
 PLUGIN_MAIN_FUNC(PluginMain)
 {
-    if (strcmp(Node, "chunkwm_export_space_changed") == 0) {
-        return SpaceChanged();
-    } else if (strcmp(Node, "chunkwm_export_display_added") == 0) {
-        return MonitorChanged(*(uint32_t*)Data);
+    if (strcmp(Node, "chunkwm_export_display_added") == 0) {
+        return SetMonitors();
     } else if (strcmp(Node, "chunkwm_export_display_removed") == 0) {
-        return MonitorChanged(*(uint32_t*)Data);
-    } else {
-        c_log(C_LOG_LEVEL_WARN, "Unknown node type: %s\n", Node);
+        return SetMonitors();
+    } else if (strcmp(Node, "chunkwm_export_space_changed") == 0) {
+        // return SpaceChanged();
     }
 
     return false;
@@ -173,6 +172,12 @@ PLUGIN_BOOL_FUNC(PluginInit)
 {
     API = ChunkwmAPI;
     c_log = API.Log;
+
+    BeginCVars(&API);
+    CreateCVar("monitors_arrangement", "3 4 4");
+    SetDesktopCounts(CVarStringValue("monitors_arrangement"));
+
+    SetMonitors();
     return true;
 }
 
